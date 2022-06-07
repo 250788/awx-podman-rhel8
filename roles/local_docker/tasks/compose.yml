@@ -1,0 +1,164 @@
+---
+- name: Create {{ docker_compose_dir }} directory
+  file:
+    path: "{{ docker_compose_dir }}"
+    state: directory
+  become_user: awx
+  become: true
+
+- name: Create Redis socket directory
+  file:
+    path: "{{ docker_compose_dir }}/redis_socket"
+    state: directory
+    mode: 0777
+  become_user: awx
+  become: true
+
+- name: Create Docker Compose Configuration
+  template:
+    src: "{{ item.file }}.j2"
+    dest: "{{ docker_compose_dir }}/{{ item.file }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - file: environment.sh
+      mode: "0600"
+    - file: credentials.py
+      mode: "0600"
+    - file: docker-compose.yml
+      mode: "0600"
+    - file: nginx.conf
+      mode: "0600"
+    - file: redis.conf
+      mode: "0664"
+  register: awx_compose_config
+  become_user: awx
+  become: true
+
+- name: Render SECRET_KEY file
+  copy:
+    content: "{{ secret_key }}"
+    dest: "{{ docker_compose_dir }}/SECRET_KEY"
+    mode: 0600
+  register: awx_secret_key
+  become_user: awx
+  become: true
+
+- name: Create AWX systemd service directory
+  file:
+    path: $HOME/.config/systemd/user
+    state: directory
+  become: true
+  become_user: awx
+
+- block:
+    - name: Remove AWX containers before migrating postgres so that the old postgres container does not get used
+      shell: /usr/local/bin/podman-compose -f {{ docker_compose_dir }}/docker-compose.yml down -v
+      become: true
+      become_user: awx
+      ignore_errors: true
+
+    - name: Run migrations in task container
+      shell: |
+             cd {{ docker_compose_dir }}
+             /usr/local/bin/podman-compose run --rm --service-ports task awx-manage migrate --no-input
+      become: true
+      become_user: awx
+
+    - name: Start the containers
+      shell: /usr/local/bin/podman-compose -f {{ docker_compose_dir }}/docker-compose.yml up -d
+      when: "{{ awx_compose_config is changed or awx_secret_key is changed }}"
+      become: true
+      become_user: awx
+      register: awx_compose_start
+
+    - name: "wait for ABC to come up"
+      uri:
+        url: "http://127.0.0.1:8085"
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 60
+      delay: 1
+
+    - name: Count the number of awx services
+      find:
+        path: $HOME/.config/systemd/user
+      register: awx_services_count
+      become: true
+      become_user: awx
+
+    - name: Create AWX systemd user services
+      shell: |
+             cd $HOME/.awx/awxcompose
+             podman generate systemd -f -n awx_redis --new
+             podman generate systemd -f -n awx_task --new
+             podman generate systemd -f -n awx_web --new
+             podman generate systemd -f -n awx_postgres --new
+             mv $HOME/.awx/awxcompose/container-awx_* $HOME/.config/systemd/user
+      become: true
+      become_user: awx
+      when: awx_services_count.examined | int < 4
+
+    - name: Restart systemd daemon for the added AWX systemd user services
+      shell: systemctl --user daemon-reload
+      become: true
+      become_user: awx
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ awx_userid }}"
+
+    - name: Stop the AWX containers
+      shell: /usr/local/bin/podman-compose -f {{ docker_compose_dir }}/docker-compose.yml down -v
+      when: "{{ awx_compose_config is changed or awx_secret_key is changed }}"
+      become: true
+      become_user: awx
+      register: awx_compose_stop
+
+    - name: Enable all AWX systemd services
+      shell: systemctl --user enable {{ item }}
+      become: true
+      become_user: awx
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ awx_userid }}"
+      with_items:
+        - container-awx_postgres.service
+        - container-awx_redis.service
+        - container-awx_task.service
+        - container-awx_web.service
+
+    - name: Start all AWX systemd services
+      shell: systemctl --user start {{ item }}
+      become: true
+      become_user: awx
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ awx_userid }}"
+      with_items:
+        - container-awx_postgres.service
+        - container-awx_redis.service
+        - container-awx_task.service
+        - container-awx_web.service
+
+    - name: Update CA trust in awx_web container
+      command: podman exec awx_web '/usr/bin/update-ca-trust'
+      when: awx_compose_config.changed or awx_compose_start.changed
+      become: true
+      become_user: awx
+
+    - name: Update CA trust in awx_task container
+      command: podman exec awx_task '/usr/bin/update-ca-trust'
+      when: awx_compose_config.changed or awx_compose_start.changed
+      become: true
+      become_user: awx
+
+    - name: Wait for launch script to create user
+      wait_for:
+        timeout: 10
+      delegate_to: localhost
+
+    - name: Create Preload data
+      command: podman exec awx_task bash -c "/usr/bin/awx-manage create_preload_data"
+      when: create_preload_data|bool
+      register: cdo
+      become: true
+      become_user: awx
+      changed_when: "'added' in cdo.stdout"
+  when: compose_start_containers|bool

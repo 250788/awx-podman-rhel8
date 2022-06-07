@@ -1,0 +1,131 @@
+---
+- name: Install podman, podman-plugins & virtualenv
+  yum:
+    name:
+      - podman
+      - podman-plugins
+      - python3
+      - python3-pip
+      - virtualenv
+    state: present
+  become: true
+
+- name: Enable podman service
+  systemd:
+    name: podman
+    state: started
+    enabled: yes
+  become: true
+
+- name: Create Python3-virtual environment folder
+  file:
+    name: "{{ awx_venv_dir }}"
+    state: directory
+  become: true
+  become_user: awx
+
+- name: Initiate virtualenv & install podman-compose (obsolete)
+  pip:
+    name: podman-compose
+    virtualenv: "{{ awx_venv_dir }}"
+    virtualenv_python: python3.6
+  become: true
+  become_user: awx
+
+- name: Install podman-compose
+  pip:
+    name: podman-compose
+  become: true
+
+- name: Check if awx_default network exists
+  shell: podman network ls | grep awx_default | awk '{print $2}'
+  become: true
+  become_user: awx
+  register: awx_network
+
+- name: Create awx_default network
+  shell: podman network create awx_default
+  become: true
+  become_user: awx
+  when: awx_network.stdout != 'awx_default'
+
+- name: Add an environment variable necessary to make systemctl --user commands work
+  lineinfile:
+    create: yes
+    group: "{{ user_awx }}"
+    line: export XDG_RUNTIME_DIR=/run/user/$(id -u)
+    mode: 0644
+    owner: "{{ user_awx }}"
+    path: /home/{{ user_awx }}/.bashrc
+  become: true
+  become_user: awx
+
+- name: Enable linger for user "{{ user_awx }}"
+  command:
+    argv:
+      - /bin/loginctl
+      - enable-linger
+      - "{{ user_awx }}"
+    creates: /var/lib/systemd/linger/{{ awx_user }}
+  become: true
+  become_user: awx
+
+- name: Reboot host and wait for it to restart
+  reboot:
+    msg: "Reboot initiated by Ansible"
+    connect_timeout: 5
+    reboot_timeout: 600
+    pre_reboot_delay: 0
+    post_reboot_delay: 30
+    test_command: whoami
+  become: true
+  when: awx_network.stdout != 'awx_default'
+
+- name: Get AWX user uid
+  getent:
+    database: passwd
+    key: awx
+  register: awx_uid
+
+- set_fact:
+    awx_userid: "{{ getent_passwd.awx[1] }}"
+
+- name: Check if rootless podman configuration exists
+  lineinfile:
+    state: absent
+    path: "/etc/subuid"
+    regexp: "{{ user_awx }}:10000:65536"
+  check_mode: true
+  changed_when: false # This just makes things look prettier in the logs
+  register: check
+  become: true
+
+- name: Configure rootless configuration for subuid & subgid
+  shell: | 
+         usermod --add-subuids 10000-75535 "{{ user_awx }}"
+         usermod --add-subgids 10000-75535 "{{ user_awx }}"
+         sudo rm -rf /run/user/{{ awx_uid }}/libpod/
+  when: check.found == 0
+  become: true
+
+- name: Check if podman rootless configuration is defined in login.defs
+  lineinfile:
+    state: absent
+    path: "/etc/login.defs"
+    regexp: "^SUB_UID_MIN"
+  check_mode: true
+  changed_when: false # This just makes things look prettier in the logs
+  register: check_logindefs
+  become: true
+
+- name: Define podman rootless configuration in login.defs
+  lineinfile:
+    state: present
+    path: "/etc/login.defs"
+    line: "{{ item }}"
+  with_items:
+    - 'SUB_UID_MIN             100000'
+    - 'SUB_UID_MAX             600100000'
+    - 'SUB_UID_COUNT           65536'
+  when: check.found == 0
+  become: true
